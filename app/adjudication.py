@@ -88,10 +88,12 @@ class Record:
     time: int
 
 
-def parse_payload(payload: Any) -> tuple[list[int], dict[str, tuple[int, int]], list[Record]]:
+def parse_payload(payload: Any) -> tuple[list[int], dict[str, tuple[int, int]], list[Record], set[str]]:
     """校验并解析请求体，非法时抛出 AdjudicationError。
 
-    返回 (按输入顺序排列的选手编号列表, 两段区间, 按输入顺序排列的记录列表)。
+    返回 (按输入顺序排列的选手编号列表, 两段区间, 按输入顺序排列的完整记录列表,
+    被隔离记录 ID 集合)。完整输入（含全部隔离记录）仍须通过原校验与 40 条限额；
+    隔离记录保留在返回的完整记录列表中，由调用方在计算前剔除。
     """
     root = _require_object(payload, "请求体")
 
@@ -101,8 +103,9 @@ def parse_payload(payload: Any) -> tuple[list[int], dict[str, tuple[int, int]], 
 
     runner_ids = parse_runners(root.get("runners"))
     records = parse_records(root.get("records"), set(runner_ids))
+    excluded = parse_excluded_ids(root.get("excludedIds"), records)
     ranges = {"SM": sm_range, "MF": mf_range}
-    return runner_ids, ranges, records
+    return runner_ids, ranges, records, excluded
 
 
 def parse_runners(runner_rows: Any) -> list[int]:
@@ -176,6 +179,36 @@ def parse_records(record_rows: Any, valid_runners: set[int]) -> list[Record]:
         time_s = _parse_nonneg_int(time_raw, f"记录 {rid} 的秒数")
         records.append(Record(id=rid, runner=runner, gate=gate_raw, time=time_s))
     return records
+
+
+def parse_excluded_ids(raw: Any, records: list[Record]) -> set[str]:
+    """解析可选的 excludedIds（暂时退出计算的可疑感应记录 ID 列表）。
+
+    - 字段缺省（None）等价于空数组：完全不隔离任何记录，保持旧行为；
+    - 必须是数组，元素必须是去空白后非空的字符串 ID；
+    - 数组内不得重复（按去空白后的 ID 比较），且每个 ID 都必须是现有
+      （完整原表中已登记）的记录 ID，否则抛 AdjudicationError（HTTP 422）。
+    注意：隔离只影响“用哪些记录参与计算”，完整输入与 40 条限额仍由
+    parse_payload/parse_records 按原表先行校验。
+    """
+    if raw is None:
+        return set()
+    if not isinstance(raw, list):
+        raise AdjudicationError("excludedIds 必须是记录 ID 数组")
+    existing_ids = {r.id for r in records}
+    excluded: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise AdjudicationError("excludedIds 的元素必须是记录 ID 字符串")
+        rid = item.strip()
+        if rid == "":
+            raise AdjudicationError("excludedIds 不能包含空 ID")
+        if rid in excluded:
+            raise AdjudicationError(f"excludedIds 包含重复的记录 ID：{rid}")
+        if rid not in existing_ids:
+            raise AdjudicationError(f"excludedIds 中的记录 ID 不存在：{rid}")
+        excluded.add(rid)
+    return excluded
 
 
 @dataclass(frozen=True)
@@ -402,9 +435,14 @@ DIAG_UNUSABLE = "unusable"
 
 
 def _diagnose_one(
-    runner: int, records: list[Record], ranges: dict[str, tuple[int, int]]
+    runner: int,
+    records: list[Record],
+    ranges: dict[str, tuple[int, int]],
+    excluded: set[str] | None = None,
 ) -> dict:
-    mine = [r for r in records if r.runner == runner]
+    excluded = excluded or set()
+    # 隔离记录暂时退出计算：既不参与现方案与替代方案，也不列入诊断对象。
+    mine = [r for r in records if r.runner == runner and r.id not in excluded]
     trips = _build_trips(mine, ranges)
 
     best_key, used, _chosen = _best_plan(trips)
@@ -470,10 +508,15 @@ def _diagnose_one(
 
 
 def _adjudicate_one(
-    runner: int, records: list[Record], ranges: dict[str, tuple[int, int]]
+    runner: int, records: list[Record], ranges: dict[str, tuple[int, int]],
+    excluded: set[str] | None = None,
 ) -> dict:
+    excluded = excluded or set()
+    # 可疑隔离记录只是暂时退出计算：仍留在完整原表中，并在结果里单列，
+    # 与“未隔离但未采纳”的普通未采纳记录区分。全部隔离时按零次处理。
     mine = [r for r in records if r.runner == runner]
-    trips = _build_trips(mine, ranges)
+    active = [r for r in mine if r.id not in excluded]
+    trips = _build_trips(active, ranges)
 
     _best_key, used, chosen = _best_plan(trips)
 
@@ -490,8 +533,13 @@ def _adjudicate_one(
     ]
     unused = [
         {"id": r.id, "gate": r.gate, "time": r.time}
-        for r in mine
+        for r in active
         if r.id not in used
+    ]
+    excluded_out = [
+        {"id": r.id, "gate": r.gate, "time": r.time}
+        for r in mine
+        if r.id in excluded
     ]
     return {
         "runner": runner,
@@ -499,30 +547,40 @@ def _adjudicate_one(
         "totalTime": sum((t.total for t in chosen), 0),
         "laps": laps_out,
         "unused": unused,
+        "excluded": excluded_out,
     }
 
 
 def adjudicate(payload: Any) -> dict:
-    """裁决入口：非法输入抛 AdjudicationError；合法时返回可序列化结果。"""
-    runner_ids, ranges, records = parse_payload(payload)
+    """裁决入口：非法输入抛 AdjudicationError；合法时返回可序列化结果。
+
+    excludedIds 中的可疑记录不参与计次计算（全部隔离按零次处理），但仍保留在
+    完整原表中，并在每名选手结果的 excluded 字段里按录入顺序单列。
+    """
+    runner_ids, ranges, records, excluded = parse_payload(payload)
     return {
-        "runners": [_adjudicate_one(rid, records, ranges) for rid in runner_ids]
+        "runners": [
+            _adjudicate_one(rid, records, ranges, excluded) for rid in runner_ids
+        ]
     }
 
 
 def diagnose(payload: Any) -> dict:
     """替代性诊断入口：输入与裁决完全相同（同一套校验），只诊断未采纳记录。
 
-    对每名选手返回按录入顺序排列的未采纳记录分类：
+    对每名选手返回按录入顺序排列的未采纳记录分类（excludedIds 隔离的记录不参与
+    计算、也不在诊断对象内）：
     - equal：存在包含该记录、且计次数与原总用时都与现方案相同的合法完整方案，
       同时给出该套方案按计次时间顺序串接的完整记录 ID 序列（同优多方案取字典序最小）；
     - inferior：该记录至少属于一条合格趟，但任何完整方案都达不到现方案；
     - unusable：该选手的任何合格趟都不包含它。
     同优判定只比 (计次数, 原总用时)，不考虑 ID 决胜与罚秒。
     """
-    runner_ids, ranges, records = parse_payload(payload)
+    runner_ids, ranges, records, excluded = parse_payload(payload)
     return {
-        "runners": [_diagnose_one(rid, records, ranges) for rid in runner_ids]
+        "runners": [
+            _diagnose_one(rid, records, ranges, excluded) for rid in runner_ids
+        ]
     }
 
 
@@ -568,10 +626,16 @@ def _count_suffix_max(trips: list[Trip]) -> tuple[list[int], list[int]]:
 
 
 def _missing_one(
-    runner: int, records: list[Record], ranges: dict[str, tuple[int, int]]
+    runner: int,
+    records: list[Record],
+    ranges: dict[str, tuple[int, int]],
+    excluded: set[str] | None = None,
 ) -> dict:
     """单名选手的漏读窗口：枚举任意两条不同门记录与缺失门 S/M/F，求“只补一条
     该门虚拟读数即可使最大计次数较原输入增加 1”的缺失读数秒数闭区间。
+
+    excludedIds 中的隔离记录暂时退出计算：窗口只基于未隔离记录，lapCount 也是
+    未隔离输入下的最大计次数（全部隔离时为 0）。
 
     数学依据（记原输入最大计次数为 K，只比趟数，不比用时/ID 决胜/罚秒）：
     - 新增一条读数最多让最大计次数 +1：从新实例的任何方案中删去含新读数的那一趟，
@@ -587,7 +651,8 @@ def _missing_one(
       缺 M 时与 t 无关——三种情形可行集都是闭区间（或空），阈值由二分直接
       求得，无需逐秒扫描，任意大的秒数全程按任意精度整数计算。
     """
-    mine = [r for r in records if r.runner == runner]
+    excluded = excluded or set()
+    mine = [r for r in records if r.runner == runner and r.id not in excluded]
     trips = _build_trips(mine, ranges)
     finishes, pref = _count_prefix_max(trips)
     starts, suff = _count_suffix_max(trips)
@@ -704,7 +769,9 @@ def find_missing(payload: Any) -> dict:
     两条 ID 依门序组成的序列字典序 排序。虚拟读数不占用 40 条录入名额；
     只比计次数，不比用时、ID 决胜或罚秒。
     """
-    runner_ids, ranges, records = parse_payload(payload)
-    runners = [_missing_one(rid, records, ranges) for rid in runner_ids]
+    runner_ids, ranges, records, excluded = parse_payload(payload)
+    runners = [
+        _missing_one(rid, records, ranges, excluded) for rid in runner_ids
+    ]
     runners.sort(key=lambda r: r["runner"])
     return {"runners": runners}

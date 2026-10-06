@@ -272,6 +272,59 @@ def test_http_endpoint_contract():
     check(r.status_code == 200 and r.json()["ok"], "诊断端点不受影响")
 
 
+def test_http_excluded_ids():
+    print("场景11：excludedIds 三端点一致的 200 / 422 合同")
+    spec = [("s1", 1, "S", 0), ("m1", 1, "M", 12), ("f1", 1, "F", 22)]
+    payload = payload_of(spec)
+
+    # 不传 excludedIds：行为完全不变。
+    r0 = client.post("/api/missing", json=payload)
+    check(r0.status_code == 200, "不传 excludedIds 仍 200")
+
+    payload["excludedIds"] = ["s1"]
+    r = client.post("/api/missing", json=payload)
+    check(r.status_code == 200 and r.json()["ok"], "合法 excludedIds 200")
+    runner = r.json()["result"]["runners"][0]
+    check(runner["lapCount"] == 0, "隔离 s1 后最大计次数按未隔离记录为 0")
+    check(all("s1" not in w["ids"] for w in runner["windows"]),
+          "隔离记录不参与漏读窗口枚举")
+
+    # 裁决结果分列隔离记录与普通未采纳记录。
+    r = client.post("/api/adjudicate", json=payload)
+    a = r.json()["result"]["runners"][0]
+    check(a["lapCount"] == 0, "裁决：隔离唯一起点后零次")
+    check([x["id"] for x in a["excluded"]] == ["s1"], "裁决：excluded 单列 s1")
+    check([u["id"] for u in a["unused"]] == ["m1", "f1"], "裁决：unused 不含隔离记录")
+
+    # 诊断不包含隔离记录。
+    r = client.post("/api/diagnose", json=payload)
+    ids = [d["id"] for d in r.json()["result"]["runners"][0]["diagnoses"]]
+    check("s1" not in ids and set(ids) == {"m1", "f1"}, "诊断：只针对未隔离未采纳记录")
+
+    for bad in (
+        ["nope"],
+        ["s1", "s1"],
+        [1],
+        "s1",
+        [""],
+    ):
+        bad_payload = dict(payload)
+        bad_payload["excludedIds"] = bad
+        r = client.post("/api/missing", json=bad_payload)
+        check(r.status_code == 422 and r.json()["ok"] is False,
+              f"非法 excludedIds {bad!r} 返回 422")
+        r = client.post("/api/diagnose", json=bad_payload)
+        check(r.status_code == 422, "诊断端点对非法 excludedIds 同样 422")
+        r = client.post("/api/adjudicate", json=bad_payload)
+        check(r.status_code == 422, "裁决端点对非法 excludedIds 同样 422")
+
+    # 隔离不能绕过 40 条限额：完整原表 41 条仍先按原规则拒绝。
+    too_many = payload_of([("r%02d" % i, 1, "S", 0) for i in range(41)])
+    too_many["excludedIds"] = ["r%02d" % i for i in range(20)]
+    r = client.post("/api/adjudicate", json=too_many)
+    check(r.status_code == 422 and "40" in r.json()["error"], "41 条即使隔离 20 条仍 422")
+
+
 # ---------------------------------------------------------------------------
 # 对拍：逐秒暴力 + 记忆化递归参考实现
 # ---------------------------------------------------------------------------
@@ -412,6 +465,7 @@ if __name__ == "__main__":
     test_validation_identical_to_adjudicate()
     test_virtual_reading_not_counted_in_40()
     test_http_endpoint_contract()
+    test_http_excluded_ids()
     test_fuzz_against_bruteforce()
     test_fuzz_multi_runner()
     if failures:

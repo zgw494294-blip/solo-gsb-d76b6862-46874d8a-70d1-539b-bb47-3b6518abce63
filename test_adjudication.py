@@ -240,7 +240,7 @@ def test_validation():
     # 全空行跳过；40 条上限
     ok = copy.deepcopy(base)
     ok["records"] = [{"id": "", "runner": "", "gate": "", "time": ""}]
-    _, _, rs = parse_payload(ok)
+    _, _, rs, _ = parse_payload(ok)
     assert rs == []
     big = copy.deepcopy(base)
     big["records"] = [
@@ -305,7 +305,7 @@ def test_big_runner_numbers():
     assert [r["runner"] for r in again["runners"]] == [big1, big2]
 
     # 前导零等值写法归一为同一编号；等值写法判重
-    ids, _, _ = parse_payload({
+    ids, _, _, _ = parse_payload({
         "standards": {"smMin": 10, "smMax": 60, "mfMin": 10, "mfMax": 60},
         "runners": [{"number": "09007199254740992"}, {"number": "007"}],
         "records": [],
@@ -339,6 +339,122 @@ def diagnose_payload(spec, runners=(101,), ranges=RANGES):
 def dmap(spec, runners=(101,)):
     out = diagnose_payload(spec, runners)
     return {r["runner"]: {d["id"]: d for d in r["diagnoses"]} for r in out["runners"]}, out
+
+
+def adj_payload(spec, runners=(101,), ranges=RANGES, excluded_ids=None):
+    p = {
+        "standards": {
+            "smMin": ranges["SM"][0], "smMax": ranges["SM"][1],
+            "mfMin": ranges["MF"][0], "mfMax": ranges["MF"][1],
+        },
+        "runners": [{"number": r} for r in runners],
+        "records": [
+            {"id": i, "runner": r, "gate": g, "time": t} for i, r, g, t in spec
+        ],
+    }
+    if excluded_ids is not None:
+        p["excludedIds"] = excluded_ids
+    return p
+
+
+def test_excluded_basic_split():
+    # 现方案两趟 a1,b1,c1 与 a2,b2,c2；a2/x2 同秒，ID 决胜选 a2。
+    spec = [
+        ("a1", 101, "S", 0), ("b1", 101, "M", 12), ("c1", 101, "F", 25),
+        ("a2", 101, "S", 30), ("x2", 101, "S", 30),
+        ("b2", 101, "M", 45), ("c2", 101, "F", 57),
+        ("x1", 101, "M", 200),
+    ]
+    out = adjudicate(adj_payload(spec, excluded_ids=["a2"]))["runners"][0]
+    # 隔离 a2 后第二趟改用 x2；a2 进入 excluded，x1 仍是普通未采纳。
+    assert out["lapCount"] == 2, out
+    assert [l["start"]["id"] for l in out["laps"]] == ["a1", "x2"], out
+    assert [x["id"] for x in out["excluded"]] == ["a2"], out
+    assert [u["id"] for u in out["unused"]] == ["x1"], out
+    print("test_excluded_basic_split OK")
+
+
+def test_excluded_all_zero_laps():
+    # 全部记录隔离：按零次处理；excluded 保留全部原记录，unused 为空。
+    spec = [("s1", 7, "S", 0), ("m1", 7, "M", 10), ("f1", 7, "F", 20)]
+    out = adjudicate(
+        adj_payload(spec, runners=(7,), excluded_ids=["s1", "m1", "f1"])
+    )["runners"][0]
+    assert out["lapCount"] == 0 and out["totalTime"] == 0, out
+    assert out["laps"] == []
+    assert out["unused"] == []
+    assert [x["id"] for x in out["excluded"]] == ["s1", "m1", "f1"], out
+    print("test_excluded_all_zero_laps OK")
+
+
+def test_excluded_diagnose_and_missing():
+    # 隔离 a2 后 x2 被采纳：诊断对象只剩 x1；漏读的 lapCount 也基于未隔离记录。
+    from app.adjudication import find_missing
+
+    spec = [
+        ("a1", 101, "S", 0), ("b1", 101, "M", 12), ("c1", 101, "F", 25),
+        ("a2", 101, "S", 30), ("x2", 101, "S", 30),
+        ("b2", 101, "M", 45), ("c2", 101, "F", 57),
+        ("x1", 101, "M", 200),
+    ]
+    diag = diagnose(adj_payload(spec, excluded_ids=["a2"]))["runners"][0]
+    assert [d["id"] for d in diag["diagnoses"]] == ["x1"], diag
+    assert all(d["id"] != "a2" for d in diag["diagnoses"])
+
+    miss = find_missing(adj_payload(spec, excluded_ids=["a2", "x2", "b2", "c2"]))
+    r = miss["runners"][0]
+    # 只剩第一趟 + 孤立 x1：K=1；枚举仅在未隔离记录上进行。
+    assert r["lapCount"] == 1, r
+    used_ids = {w["ids"][0] for w in r["windows"]} | {w["ids"][1] for w in r["windows"]}
+    assert not ({"a2", "x2", "b2", "c2"} & used_ids), r
+    print("test_excluded_diagnose_and_missing OK")
+
+
+def test_excluded_validation():
+    base = adj_payload(
+        [("s1", 101, "S", 0), ("m1", 101, "M", 10), ("f1", 101, "F", 20)]
+    )
+
+    def must_fail(tweak, label):
+        payload = copy.deepcopy(base)
+        tweak(payload)
+        for fn in (adjudicate, diagnose):
+            try:
+                fn(payload)
+            except AdjudicationError:
+                continue
+            raise AssertionError(f"{fn.__name__} 应当校验失败: {label}")
+
+    must_fail(lambda p: p.update(excludedIds="s1"), "非数组")
+    must_fail(lambda p: p.update(excludedIds=123), "非数组（数字）")
+    must_fail(lambda p: p.update(excludedIds=[1]), "元素非字符串")
+    must_fail(lambda p: p.update(excludedIds=["s1", "s1"]), "数组内重复")
+    must_fail(lambda p: p.update(excludedIds=[" s1 ", "s1"]), "去空白后重复")
+    must_fail(lambda p: p.update(excludedIds=["nope"]), "ID 不存在")
+    must_fail(lambda p: p.update(excludedIds=["  nope "]), "去空白后仍不存在")
+    must_fail(lambda p: p.update(excludedIds=[""]), "空 ID")
+    must_fail(lambda p: p.update(excludedIds=[None]), "null 元素")
+
+    # 缺省字段与空数组等价：完全不隔离，旧行为不变。
+    no_field = adjudicate(copy.deepcopy(base))["runners"][0]
+    empty = adjudicate({**copy.deepcopy(base), "excludedIds": []})["runners"][0]
+    assert no_field == empty
+    assert no_field["lapCount"] == 1 and no_field["excluded"] == []
+    # 去空白等值的 ID 写法可命中现有记录。
+    trimmed = adjudicate({**copy.deepcopy(base), "excludedIds": ["  s1  "]})["runners"][0]
+    assert [x["id"] for x in trimmed["excluded"]] == ["s1"], trimmed
+    assert trimmed["lapCount"] == 0
+    # 完整输入仍先按原规则校验：41 条限额不因隔离而放宽。
+    too_many = copy.deepcopy(base)
+    too_many["records"] = [
+        {"id": f"r{i}", "runner": 101, "gate": "S", "time": 0} for i in range(41)]
+    too_many["excludedIds"] = [f"r{i}" for i in range(20)]
+    try:
+        adjudicate(too_many)
+        raise AssertionError("41 条即使全部隔离也应按原限额拒绝")
+    except AdjudicationError:
+        pass
+    print("test_excluded_validation OK")
 
 
 def test_diagnose_equal_second_lap():
@@ -580,6 +696,10 @@ if __name__ == "__main__":
     test_count_beats_time()
     test_validation()
     test_big_runner_numbers()
+    test_excluded_basic_split()
+    test_excluded_all_zero_laps()
+    test_excluded_diagnose_and_missing()
+    test_excluded_validation()
     test_diagnose_equal_second_lap()
     test_diagnose_equal_first_lap_whole_plan()
     test_diagnose_inferior_loses_count()

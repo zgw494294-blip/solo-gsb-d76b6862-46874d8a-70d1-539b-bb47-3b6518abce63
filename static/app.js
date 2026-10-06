@@ -102,6 +102,7 @@ function recordRowHtml() {
         </select>
       </td>
       <td><input type="number" min="0" step="1" class="rec-time" placeholder="非负秒" /></td>
+      <td><button type="button" class="btn secondary exclude-toggle" disabled>隔离</button></td>
       <td><button type="button" class="btn danger remove-record">×</button></td>
     </tr>`;
 }
@@ -159,11 +160,110 @@ runnerRows.addEventListener("click", (e) => {
 });
 recordRows.addEventListener("click", (e) => {
   if (e.target.classList.contains("remove-record")) {
+    // 删除先于 remove()：行上可能存在的隔离绑定此刻随记录删除而解除。
+    syncExcludedRows();
     e.target.closest(".record-row").remove();
     refreshRecordCount();
+    syncExcludedRows();
     onInputChanged();
+    return;
+  }
+  // 每行的“隔离 / 重新纳入”开关：只对四字段完整的行可点；切换后立即重裁。
+  if (e.target.classList.contains("exclude-toggle")) {
+    onExclusionToggled(e.target.closest(".record-row"));
   }
 });
+
+/* ---------- 可疑感应记录隔离（暂时退出计算，原始读数仍留在表中） ---------- */
+
+// 隔离绑定到记录的完整身份（ID + 选手编号 + 门 + 秒数），而不是行号：
+// 重排行、增删或修改无关记录都保留隔离；任一绑定值改变或记录删除即解除，
+// 改回原值也不恢复（与复核失效同语义）。只保存在页面内存中，
+// 清空 / 填入示例 / 刷新页面全部清除。编号与秒数先按现有规则归一：
+// ID 去首尾空白，编号/秒数按整数等值（前导零写法不算改变绑定）。
+const excludedBindings = new Set(); // JSON.stringify([id, runnerText, gate, timeText])
+
+// 仅供生命周期测试读取当前隔离身份键集合。
+if (typeof globalThis !== "undefined") {
+  globalThis.__excludedForTest = excludedBindings;
+}
+
+function recordBindingKey(row) {
+  const id = row.querySelector(".rec-id").value.trim();
+  const runnerRaw = row.querySelector(".rec-runner").value.trim();
+  const gate = row.querySelector(".rec-gate").value;
+  const timeRaw = row.querySelector(".rec-time").value.trim();
+  // 四字段任一为空（占位行/部分行）都没有可隔离身份。
+  if (id === "" || runnerRaw === "" || gate === "" || timeRaw === "") return null;
+  const runner = parseRunnerNumber(runnerRaw);
+  const time = intToText(timeRaw);
+  if (runner === null || time === null) return null; // 编号/秒数非法：绑定无法成立
+  return JSON.stringify([id, runner, gate, time]);
+}
+
+// 以当前表为准核对隔离集合：身份仍与某一行完全一致的绑定保留，其余全部解除
+// （任一绑定值改变、行删除、ID 重复导致无法唯一定位等），改回原值不恢复；
+// 同时刷新每行开关的可用状态、文案与行样式。
+function syncExcludedRows() {
+  const present = new Set();
+  const seen = new Set();
+  const duplicated = new Set();
+  for (const row of recordRows.querySelectorAll(".record-row")) {
+    const key = recordBindingKey(row);
+    if (key === null) continue;
+    if (seen.has(key)) duplicated.add(key);
+    seen.add(key);
+    present.add(key);
+  }
+  for (const key of [...excludedBindings]) {
+    if (!present.has(key) || duplicated.has(key)) excludedBindings.delete(key);
+  }
+  for (const row of recordRows.querySelectorAll(".record-row")) {
+    const key = recordBindingKey(row);
+    paintExcludeRow(row, key, key !== null && excludedBindings.has(key));
+  }
+}
+
+function paintExcludeRow(row, key, excluded) {
+  const btn = row.querySelector(".exclude-toggle");
+  if (!btn) return;
+  if (key === null) {
+    // 空行/部分填写/编号或秒数非法：不可隔离。
+    btn.disabled = true;
+    btn.textContent = "隔离";
+    row.classList.remove("row-excluded");
+    return;
+  }
+  btn.disabled = false;
+  btn.textContent = excluded ? "重新纳入" : "隔离";
+  // 用 add/remove 而非 toggle，兼容最简 DOM 桩。
+  if (excluded) row.classList.add("row-excluded");
+  else row.classList.remove("row-excluded");
+}
+
+// 切换隔离：先按当前表解除失效绑定，再翻转本行身份；随后立即重裁
+// （旧结果、诊断、漏读窗口与导入预览随 onInputChanged 同款流程清除）。
+function onExclusionToggled(row) {
+  syncExcludedRows();
+  const key = recordBindingKey(row);
+  if (key === null) return;
+  if (excludedBindings.has(key)) excludedBindings.delete(key);
+  else excludedBindings.add(key);
+  syncExcludedRows();
+
+  // 与手动裁决同款：取消待发防抖、立即按当前（含隔离）输入重裁。
+  inputVersion += 1;
+  pruneReviewsByBindings();
+  prunePenaltiesByRunners();
+  invalidateImportPreview();
+  clearOutcome();
+  pendingHint.hidden = false;
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+  }
+  runAdjudication();
+}
 
 /* ---------- 输入修改后自动重算 ---------- */
 
@@ -225,6 +325,8 @@ if (typeof globalThis !== "undefined") {
 
 function onInputChanged() {
   inputVersion += 1;
+  // 先按当前输入即时核对隔离绑定：任一绑定值改变或行删除，隔离此刻即解除。
+  syncExcludedRows();
   // 先按当前输入即时丢弃绑定已失效的复核：不必、也不能等到合法裁决返回。
   pruneReviewsByBindings();
   // 选手编号被修改或选手被删除时，对应罚秒也在此刻立即清除（改回不恢复）。
@@ -244,6 +346,7 @@ function onInputChanged() {
 // 合并成功后的自动重算：与输入变化一样重跑裁决，但保留“已合并 N 条”的成功提示。
 function rerunAfterMerge() {
   inputVersion += 1;
+  syncExcludedRows();
   pruneReviewsByBindings();
   prunePenaltiesByRunners();
   clearOutcome();
@@ -270,12 +373,25 @@ function collectPayload() {
     .filter((v) => v !== "")
     .map((v) => ({ number: v }));
 
-  const records = [...recordRows.querySelectorAll(".record-row")].map((row) => ({
+  const recordRowEls = [...recordRows.querySelectorAll(".record-row")];
+  const records = recordRowEls.map((row) => ({
     id: row.querySelector(".rec-id").value.trim(),
     runner: row.querySelector(".rec-runner").value.trim(),
     gate: row.querySelector(".rec-gate").value,
     time: row.querySelector(".rec-time").value.trim(),
   }));
+
+  // 隔离 ID 按表中出现顺序收集（同一身份键至多出现一次）：完整原表仍全部发送，
+  // 由服务端先按原规则校验完整输入与 40 条限额，再只用未隔离记录参与计算。
+  const excludedIds = [];
+  const seenKeys = new Set();
+  for (const row of recordRowEls) {
+    const key = recordBindingKey(row);
+    if (key !== null && excludedBindings.has(key) && !seenKeys.has(key)) {
+      seenKeys.add(key);
+      excludedIds.push(row.querySelector(".rec-id").value.trim());
+    }
+  }
 
   return {
     standards: {
@@ -286,6 +402,7 @@ function collectPayload() {
     },
     runners,
     records,
+    excludedIds,
   };
 }
 
@@ -454,6 +571,11 @@ function normalizeResult(result) {
     }
     for (const u of r.unused) {
       u.time = asText(u.time);
+    }
+    // 隔离记录只是暂时退出计算：秒数同样规范为十进制字符串并单独展示。
+    if (!Array.isArray(r.excluded)) r.excluded = [];
+    for (const x of r.excluded) {
+      x.time = asText(x.time);
     }
   }
   return result;
@@ -955,7 +1077,7 @@ function renderResults(result) {
 
       const unusedHtml =
         r.unused.length === 0
-          ? `<span class="empty-line">（无未采纳记录）</span>`
+          ? `<span class="empty-line">（无普通未采纳记录）</span>`
           : r.unused
               .map(
                 (u) =>
@@ -964,6 +1086,23 @@ function renderResults(result) {
                   )} · ${u.time} 秒</span>`
               )
               .join("");
+
+      // 隔离记录与普通未采纳记录分两列展示：隔离只是暂时退出计算，读数仍留在原表。
+      const excludedChipsHtml = r.excluded
+        .map(
+          (x) =>
+            `<span class="chip-mini excluded ${x.gate}">${GATE_LABELS[x.gate]} · ${escapeHtml(
+              x.id
+            )} · ${x.time} 秒</span>`
+        )
+        .join("");
+      const excludedSectionHtml =
+        r.excluded.length === 0
+          ? ""
+          : `<div class="subsection excluded-subsection">
+          <h4>隔离记录（可疑读数暂时退出计算，原始读数仍保留在表中）</h4>
+          ${excludedChipsHtml}
+        </div>`;
 
       return `
       <section class="result-card">
@@ -977,6 +1116,7 @@ function renderResults(result) {
           <h4>未采纳记录（该选手输入但未进入任何一趟）</h4>
           ${unusedHtml}
         </div>
+        ${excludedSectionHtml}
       </section>`;
     })
     .join("");
@@ -1642,6 +1782,8 @@ function appendImportedRecords(added) {
     row.querySelector(".rec-time").value = e.time;
   }
   refreshRecordCount();
+  // 新行初始不隔离；既有隔离绑定与重排无关，原样保留。
+  syncExcludedRows();
 }
 
 async function runImportConfirm() {
@@ -1894,6 +2036,7 @@ function resetImportUi() {
 function loadSample() {
   reviews.clear(); // 载入示例同时清掉全部复核记录
   penalties.clear(); // 同时清掉全部罚秒
+  excludedBindings.clear(); // 隔离只在本次页面会话保留：载入示例全部清除
   resetImportUi(); // 同时清除上传文件与导入预览
   document.getElementById("smMin").value = SAMPLE.smMin;
   document.getElementById("smMax").value = SAMPLE.smMax;
@@ -1914,6 +2057,7 @@ function loadSample() {
     row.querySelector(".rec-time").value = rec.time;
   });
   refreshRecordCount();
+  syncExcludedRows();
 
   onInputChanged(); // 载入示例后按当前完整输入自动重算
 }
@@ -1923,6 +2067,7 @@ function clearAll() {
   inputVersion += 1;
   reviews.clear(); // 清空同时清掉全部复核记录
   penalties.clear(); // 同时清掉全部罚秒
+  excludedBindings.clear(); // 同时解除全部隔离
   resetImportUi(); // 同时清除上传文件与导入预览
   if (debounceTimer) {
     clearTimeout(debounceTimer);
@@ -1936,6 +2081,7 @@ function clearAll() {
   addRunnerRow();
   recordRows.innerHTML = "";
   addRecordRow();
+  syncExcludedRows();
   clearOutcome(); // 同时清掉结果与错误
   pendingHint.hidden = true;
 }
@@ -1949,3 +2095,4 @@ addRecordRow();
 addRecordRow();
 refreshRunnerButtons();
 refreshRecordCount();
+syncExcludedRows();

@@ -94,6 +94,25 @@ input:focus, select:focus {
 }
 .record-table input, .record-table select { width: 100%; }
 .record-table tr + tr td { border-top: 1px solid #eef1f6; }
+/* 隔离行：可疑记录暂时退出计算，整行以琥珀色底纹与左侧标记提示，读数仍保留可编辑 */
+.record-table tr.row-excluded td { background: #fff7ed; }
+.record-table tr.row-excluded input,
+.record-table tr.row-excluded select {
+  opacity: 0.75;
+  text-decoration: line-through;
+  text-decoration-color: #c2750a;
+  text-decoration-thickness: 1px;
+}
+.btn.exclude-toggle {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+tr.row-excluded .btn.exclude-toggle {
+  background: #fef3c7;
+  border-color: #fcd34d;
+  color: #92400e;
+}
 
 .btn {
   font: inherit;
@@ -384,6 +403,15 @@ input:focus, select:focus {
 .chip-mini.s { background: var(--chip-s); border-color: #bfdbfe; }
 .chip-mini.m { background: var(--chip-m); border-color: #fde68a; }
 .chip-mini.f { background: var(--chip-f); border-color: #bbf7d0; }
+/* 隔离记录在结果区单列：琥珀描边，区别于普通未采纳记录 */
+.chip-mini.excluded {
+  background: #fff7ed;
+  border-color: #fcd34d;
+  color: #92400e;
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+.excluded-subsection h4 { color: #92400e; }
 .empty-line { color: var(--muted); font-size: 0.84rem; }
 
 /* ---------- 查找漏读 ---------- */

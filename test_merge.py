@@ -251,6 +251,24 @@ def test_confirm_endpoint_and_contracts():
     check(client.post("/api/adjudicate", data="{", headers={"Content-Type": "application/json"})
           .status_code == 400, "非 JSON 400 合同不变")
 
+    # 隔离记录仍留在完整原表中：CSV 合并对完整原表去重/计数，
+    # context 里的 excludedIds 不能跳过同 ID 冲突，也不能绕过 40 条限额。
+    ctx_excl = dict(CONTEXT)
+    ctx_excl["excludedIds"] = ["a1"]
+    # a1 虽被隔离，文件中同 ID 内容冲突仍须整批拒绝。
+    r = post("/api/import/preview", context=ctx_excl,
+             data=b"id,runner,gate,time\na1,102,S,0\n")
+    check(r.status_code == 422 and "冲突" in r.json()["error"],
+          "隔离记录与文件同 ID 冲突仍整批拒绝（隔离不能跳过冲突）")
+    # 同 ID 内容一致仍按重复跳过（不追加、不占位冲突）。
+    r = post("/api/import/preview", context=ctx_excl,
+             data=b"id,runner,gate,time\na1,101,S,0\nn1,101,F,9\n")
+    check(r.status_code == 200 and len(r.json()["result"]["added"]) == 1
+          and len(r.json()["result"]["duplicates"]) == 1,
+          "隔离记录同 ID 内容一致仍按重复跳过")
+    # context 多出的 excludedIds 键本身被忽略，不影响合并校验。
+    check(r.json()["result"]["existingCount"] == 3, "existingCount 仍按完整原表计数")
+
 
 def main():
     test_basic_preview()
