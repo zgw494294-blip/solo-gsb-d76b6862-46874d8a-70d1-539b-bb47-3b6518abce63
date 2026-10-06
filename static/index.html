@@ -56,6 +56,7 @@
                 <th style="width:8rem">选手编号</th>
                 <th style="width:8rem">门</th>
                 <th style="width:8rem">秒数</th>
+                <th style="width:5.5rem">隔离</th>
                 <th style="width:3rem"></th>
               </tr>
             </thead>
@@ -63,6 +64,12 @@
           </table>
         </div>
         <p class="hint">记录可乱序、同一秒可有多条；全空行会自动忽略，部分填写视为非法。</p>
+        <p class="hint">
+          可疑记录可点行内<strong>“隔离”</strong>暂时退出计算（原始读数仍留在表中，不删除），切换后自动重裁，
+          结果中单列“隔离记录”，与普通未采纳记录分开；再点<strong>“重新纳入”</strong>恢复。
+          隔离绑定 ID、选手编号、门与秒数（去空白与整数等值比较）：任一绑定值改变或删行即解除，改回不恢复；
+          重排与无关编辑保留，清空、填入示例或刷新清除。全部隔离按零次处理；设备日志合并仍对完整原表去重与计数，隔离不能跳过冲突或绕过 40 条上限。
+        </p>
       </section>
 
       <section class="card">

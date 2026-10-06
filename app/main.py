@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from .adjudication import AdjudicationError, adjudicate, diagnose, find_missing
 from .merge import MergeError, preview_merge
 
-app = FastAPI(title="本地赛道计次裁决台", version="1.2.0")
+app = FastAPI(title="本地赛道计次裁决台", version="1.3.0")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 

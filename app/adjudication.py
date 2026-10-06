@@ -88,10 +88,13 @@ class Record:
     time: int
 
 
-def parse_payload(payload: Any) -> tuple[list[int], dict[str, tuple[int, int]], list[Record]]:
+def parse_payload(
+    payload: Any,
+) -> tuple[list[int], dict[str, tuple[int, int]], list[Record], set[str]]:
     """校验并解析请求体，非法时抛出 AdjudicationError。
 
-    返回 (按输入顺序排列的选手编号列表, 两段区间, 按输入顺序排列的记录列表)。
+    返回 (按输入顺序排列的选手编号列表, 两段区间, 按输入顺序排列的记录列表,
+    被隔离（暂时退出计算）的记录 ID 集合)。
     """
     root = _require_object(payload, "请求体")
 
@@ -101,8 +104,41 @@ def parse_payload(payload: Any) -> tuple[list[int], dict[str, tuple[int, int]], 
 
     runner_ids = parse_runners(root.get("runners"))
     records = parse_records(root.get("records"), set(runner_ids))
+    # 完整输入与 40 条限额先按原规则校验通过后，才处理隔离列表：
+    # 隔离既不能让非法输入变成合法，也不能绕过条数上限。
+    if "excludedIds" in root and root["excludedIds"] is None:
+        # 显式 null 非法；只有“缺省该字段”才按空列表处理。
+        raise AdjudicationError("隔离记录 ID 列表（excludedIds）必须是数组")
+    excluded_ids = parse_excluded_ids(root.get("excludedIds"), records)
     ranges = {"SM": sm_range, "MF": mf_range}
-    return runner_ids, ranges, records
+    return runner_ids, ranges, records, excluded_ids
+
+
+def parse_excluded_ids(value: Any, records: list[Record]) -> set[str]:
+    """解析可选的隔离记录 ID 列表（缺省为空）。
+
+    规则：必须是数组；元素必须是字符串，按记录 ID 同款“去首尾空白”规则归一，
+    不允许空白 ID、不允许重复（去空白后）、每个 ID 都必须是现有记录 ID。
+    任何不符均抛 AdjudicationError（端点返回 422）。
+    """
+    if value is None:
+        return set()
+    if not isinstance(value, list):
+        raise AdjudicationError("隔离记录 ID 列表（excludedIds）必须是数组")
+    known_ids = {r.id for r in records}
+    excluded: set[str] = set()
+    for i, item in enumerate(value, 1):
+        if not isinstance(item, str):
+            raise AdjudicationError(f"第 {i} 个隔离记录 ID 必须是字符串")
+        rid = item.strip()
+        if rid == "":
+            raise AdjudicationError("隔离记录 ID 不能为空")
+        if rid in excluded:
+            raise AdjudicationError(f"隔离记录 ID 重复：{rid}")
+        if rid not in known_ids:
+            raise AdjudicationError(f"隔离记录 ID 不存在：{rid}")
+        excluded.add(rid)
+    return excluded
 
 
 def parse_runners(runner_rows: Any) -> list[int]:
@@ -402,9 +438,15 @@ DIAG_UNUSABLE = "unusable"
 
 
 def _diagnose_one(
-    runner: int, records: list[Record], ranges: dict[str, tuple[int, int]]
+    runner: int,
+    records: list[Record],
+    ranges: dict[str, tuple[int, int]],
+    excluded_ids: set[str] | None = None,
 ) -> dict:
-    mine = [r for r in records if r.runner == runner]
+    excluded_ids = excluded_ids or set()
+    # 诊断与裁决使用同一份“未隔离记录”：隔离记录既不会被采纳，也不属于
+    # 普通未采纳记录，因此不出现在诊断结果中。
+    mine = [r for r in records if r.runner == runner and r.id not in excluded_ids]
     trips = _build_trips(mine, ranges)
 
     best_key, used, _chosen = _best_plan(trips)
@@ -470,10 +512,18 @@ def _diagnose_one(
 
 
 def _adjudicate_one(
-    runner: int, records: list[Record], ranges: dict[str, tuple[int, int]]
+    runner: int,
+    records: list[Record],
+    ranges: dict[str, tuple[int, int]],
+    excluded_ids: set[str] | None = None,
 ) -> dict:
+    excluded_ids = excluded_ids or set()
     mine = [r for r in records if r.runner == runner]
-    trips = _build_trips(mine, ranges)
+    # 被隔离的记录原始读数仍保留：不参与任何计算，但单独列入“隔离记录”，
+    # 与普通“未采纳记录”分列；全部隔离时按零次处理。
+    mine_active = [r for r in mine if r.id not in excluded_ids]
+    mine_excluded = [r for r in mine if r.id in excluded_ids]
+    trips = _build_trips(mine_active, ranges)
 
     _best_key, used, chosen = _best_plan(trips)
 
@@ -490,8 +540,11 @@ def _adjudicate_one(
     ]
     unused = [
         {"id": r.id, "gate": r.gate, "time": r.time}
-        for r in mine
+        for r in mine_active
         if r.id not in used
+    ]
+    excluded_out = [
+        {"id": r.id, "gate": r.gate, "time": r.time} for r in mine_excluded
     ]
     return {
         "runner": runner,
@@ -499,14 +552,17 @@ def _adjudicate_one(
         "totalTime": sum((t.total for t in chosen), 0),
         "laps": laps_out,
         "unused": unused,
+        "excluded": excluded_out,
     }
 
 
 def adjudicate(payload: Any) -> dict:
     """裁决入口：非法输入抛 AdjudicationError；合法时返回可序列化结果。"""
-    runner_ids, ranges, records = parse_payload(payload)
+    runner_ids, ranges, records, excluded_ids = parse_payload(payload)
     return {
-        "runners": [_adjudicate_one(rid, records, ranges) for rid in runner_ids]
+        "runners": [
+            _adjudicate_one(rid, records, ranges, excluded_ids) for rid in runner_ids
+        ]
     }
 
 
@@ -520,9 +576,11 @@ def diagnose(payload: Any) -> dict:
     - unusable：该选手的任何合格趟都不包含它。
     同优判定只比 (计次数, 原总用时)，不考虑 ID 决胜与罚秒。
     """
-    runner_ids, ranges, records = parse_payload(payload)
+    runner_ids, ranges, records, excluded_ids = parse_payload(payload)
     return {
-        "runners": [_diagnose_one(rid, records, ranges) for rid in runner_ids]
+        "runners": [
+            _diagnose_one(rid, records, ranges, excluded_ids) for rid in runner_ids
+        ]
     }
 
 
@@ -568,7 +626,10 @@ def _count_suffix_max(trips: list[Trip]) -> tuple[list[int], list[int]]:
 
 
 def _missing_one(
-    runner: int, records: list[Record], ranges: dict[str, tuple[int, int]]
+    runner: int,
+    records: list[Record],
+    ranges: dict[str, tuple[int, int]],
+    excluded_ids: set[str] | None = None,
 ) -> dict:
     """单名选手的漏读窗口：枚举任意两条不同门记录与缺失门 S/M/F，求“只补一条
     该门虚拟读数即可使最大计次数较原输入增加 1”的缺失读数秒数闭区间。
@@ -587,7 +648,11 @@ def _missing_one(
       缺 M 时与 t 无关——三种情形可行集都是闭区间（或空），阈值由二分直接
       求得，无需逐秒扫描，任意大的秒数全程按任意精度整数计算。
     """
-    mine = [r for r in records if r.runner == runner]
+    mine = [
+        r
+        for r in records
+        if r.runner == runner and r.id not in (excluded_ids or set())
+    ]
     trips = _build_trips(mine, ranges)
     finishes, pref = _count_prefix_max(trips)
     starts, suff = _count_suffix_max(trips)
@@ -704,7 +769,9 @@ def find_missing(payload: Any) -> dict:
     两条 ID 依门序组成的序列字典序 排序。虚拟读数不占用 40 条录入名额；
     只比计次数，不比用时、ID 决胜或罚秒。
     """
-    runner_ids, ranges, records = parse_payload(payload)
-    runners = [_missing_one(rid, records, ranges) for rid in runner_ids]
+    runner_ids, ranges, records, excluded_ids = parse_payload(payload)
+    runners = [
+        _missing_one(rid, records, ranges, excluded_ids) for rid in runner_ids
+    ]
     runners.sort(key=lambda r: r["runner"])
     return {"runners": runners}

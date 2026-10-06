@@ -112,6 +112,30 @@ input:focus, select:focus {
 .btn.danger { background: transparent; color: var(--err); border-color: #fecaca; padding: 0.3rem 0.55rem; }
 .btn.danger:hover { background: var(--err-bg); }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn.tiny { padding: 0.2rem 0.5rem; font-size: 0.78rem; white-space: nowrap; }
+
+/* 隔离中的记录行：整行淡化并加左侧提示色，原始读数仍可读、可改 */
+.record-row.excluded { background: #f8fafc; opacity: 0.62; }
+.record-row.excluded .toggle-exclude {
+  color: var(--brand);
+  border-color: #c7d2fe;
+  background: #eef2ff;
+}
+.btn.ghost.toggle-exclude.is-excluded { font-weight: 600; }
+.exclude-cell { text-align: center; }
+
+/* 结果区的“隔离记录”单列：与普通未采纳记录视觉区分 */
+.excluded-subsection {
+  margin-top: 0.7rem;
+  padding-top: 0.6rem;
+  border-top: 1px dashed var(--line);
+}
+.chip-mini.excluded-chip {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+  text-decoration: line-through;
+  text-decoration-color: rgba(100, 116, 139, 0.65);
+}
 
 .actions { display: flex; gap: 0.7rem; flex-wrap: wrap; margin: 1.1rem 0; }
 

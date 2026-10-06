@@ -240,8 +240,8 @@ def test_validation():
     # 全空行跳过；40 条上限
     ok = copy.deepcopy(base)
     ok["records"] = [{"id": "", "runner": "", "gate": "", "time": ""}]
-    _, _, rs = parse_payload(ok)
-    assert rs == []
+    _, _, rs, excluded = parse_payload(ok)
+    assert rs == [] and excluded == set()
     big = copy.deepcopy(base)
     big["records"] = [
         {"id": f"r{i}", "runner": 1, "gate": "S", "time": 0} for i in range(41)]
@@ -305,7 +305,7 @@ def test_big_runner_numbers():
     assert [r["runner"] for r in again["runners"]] == [big1, big2]
 
     # 前导零等值写法归一为同一编号；等值写法判重
-    ids, _, _ = parse_payload({
+    ids, _, _, _ = parse_payload({
         "standards": {"smMin": 10, "smMax": 60, "mfMin": 10, "mfMax": 60},
         "runners": [{"number": "09007199254740992"}, {"number": "007"}],
         "records": [],
